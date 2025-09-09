@@ -8,13 +8,15 @@ WORKDIR /app
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=UTC \
     MODEL_CACHE_DIR=/app/models \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRRARY_PATH \
     PYTHONUNBUFFERED=1 \
     HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
     TRANSFORMERS_CACHE=/app/models \
-    HF_HOME=/app/models
+    HF_HOME=/app/models \
+    PIP_DEFAULT_TIMEOUT=100 \
+    PIP_NO_CACHE_DIR=off
 
-# Install system dependencies
+# Install system dependencies first (use Ubuntu's Python 3.10)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     software-properties-common \
@@ -24,16 +26,10 @@ RUN apt-get update && \
     ca-certificates \
     ffmpeg \
     libsndfile1 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Add deadsnakes PPA for Python 3.10
-RUN add-apt-repository ppa:deadsnakes/ppa && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends \
     python3.10 \
     python3.10-dev \
-    python3.10-distutils \
     python3.10-venv \
+    python3.10-distutils \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Python 3.10 as default
@@ -47,15 +43,18 @@ RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
 # Create model cache directory
 RUN mkdir -p /app/models
 
-# Copy files
+# Copy requirements first for better caching
 COPY requirements.txt .
-COPY app.py .
 
-# Install Python dependencies
+# Install Python dependencies with retries and timeouts
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir torch==2.0.1+cu118 torchaudio==2.0.2+cu118 \
-        --index-url https://download.pytorch.org/whl/cu118 --extra-index-url https://pypi.org/simple && \
-    pip install --no-cache-dir -r requirements.txt --extra-index-url https://pypi.org/simple
+    pip install --no-cache-dir --timeout=100 --retries=5 \
+    torch==2.0.1+cu118 torchaudio==2.0.2+cu118 \
+    --index-url https://download.pytorch.org/whl/cu118 && \
+    pip install --no-cache-dir --timeout=100 --retries=5 -r requirements.txt
+
+# Copy application code
+COPY app.py .
 
 # Verify model cache directory is accessible
 RUN python -c "\
@@ -73,7 +72,7 @@ print('✅ Model cache directory is accessible and writable');"
 # Clean up
 RUN apt-get autoremove -y && \
     apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* ~/.cache/pip
 
 # Run app
 CMD ["python", "app.py"]
