@@ -13,6 +13,7 @@ import torch
 import shutil
 import numpy as np
 from transformers import AutoProcessor, SeamlessM4Tv2Model
+import soundfile as sf  # Add this import
 
 # --- Configuration ---
 COMPUTE_TYPE = "float16"
