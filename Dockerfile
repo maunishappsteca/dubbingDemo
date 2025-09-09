@@ -4,7 +4,7 @@ FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 # Set working directory
 WORKDIR /app
 
-# Set environment variables first
+# Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=UTC \
     MODEL_CACHE_DIR=/app/models \
@@ -14,7 +14,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TRANSFORMERS_CACHE=/app/models \
     HF_HOME=/app/models
 
-# Install system dependencies efficiently
+# Install system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     software-properties-common \
@@ -41,7 +41,7 @@ RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1
     update-alternatives --set python3 /usr/bin/python3.10 && \
     ln -sf /usr/bin/python3 /usr/bin/python
 
-# Install pip for Python 3.10
+# Install pip
 RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
 
 # Create model cache directory
@@ -51,10 +51,11 @@ RUN mkdir -p /app/models
 COPY requirements.txt .
 COPY app.py .
 
-# Install Python dependencies with compatible versions
+# Install Python dependencies
 RUN pip install --upgrade pip && \
-    pip install --no-cache-dir torch==2.0.1+cu118 torchaudio==2.0.2+cu118 --index-url https://download.pytorch.org/whl/cu118 && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir torch==2.0.1+cu118 torchaudio==2.0.2+cu118 \
+        --index-url https://download.pytorch.org/whl/cu118 --extra-index-url https://pypi.org/simple && \
+    pip install --no-cache-dir -r requirements.txt --extra-index-url https://pypi.org/simple
 
 # Verify model cache directory is accessible
 RUN python -c "\
@@ -63,17 +64,16 @@ cache_dir = '/app/models'; \
 print(f'Model cache directory: {cache_dir}'); \
 print(f'Directory exists: {os.path.exists(cache_dir)}'); \
 print(f'Directory writable: {os.access(cache_dir, os.W_OK)}'); \
-# Create test file to verify permissions \
 test_file = os.path.join(cache_dir, 'test_permissions.txt'); \
 with open(test_file, 'w') as f: \
     f.write('test'); \
 os.remove(test_file); \
 print('✅ Model cache directory is accessible and writable');"
 
-# Clean up to reduce image size
+# Clean up
 RUN apt-get autoremove -y && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-# Run the app
+# Run app
 CMD ["python", "app.py"]
