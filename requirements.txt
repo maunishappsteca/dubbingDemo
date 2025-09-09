@@ -1,4 +1,3 @@
-# PyTorch + CUDA
 torch==2.0.1+cu118
 torchaudio==2.0.2+cu118
 

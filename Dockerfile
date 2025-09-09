@@ -41,4 +41,5 @@ RUN python -c "from transformers import AutoProcessor, SeamlessM4Tv2Model; \
     AutoProcessor.from_pretrained('facebook/seamless-m4t-v2-large', cache_dir='/app/models'); \
     SeamlessM4Tv2Model.from_pretrained('facebook/seamless-m4t-v2-large', cache_dir='/app/models')"
 
+#Starts the app
 CMD ["python", "app.py"]

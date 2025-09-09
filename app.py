@@ -187,6 +187,7 @@ def handler(job):
         clear_gpu_memory()
         gc.collect()
 
+#initial
 if __name__ == "__main__":
     print("🚀 Starting Dubbing API Endpoint...")
     if os.environ.get("RUNPOD_SERVERLESS_MODE") == "true":
