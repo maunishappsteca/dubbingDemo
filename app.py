@@ -5,21 +5,19 @@ import runpod
 import boto3
 import gc
 import json
-from typing import Optional
-from botocore.exceptions import ClientError
+import sys
 import logging
-from datetime import datetime
 import torch
-import shutil
 import numpy as np
+import soundfile as sf
 from transformers import AutoProcessor, SeamlessM4Tv2Model
-import soundfile as sf  # Add this import
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
 # --- Configuration ---
 COMPUTE_TYPE = "float16"
 S3_BUCKET = os.environ.get("S3_BUCKET_NAME")
 MODEL_CACHE_DIR = os.getenv("MODEL_CACHE_DIR", "/app/models")
-S3_OUTPUT_DIR = "dubbingDemoOutput"  # Base directory for outputs
+S3_OUTPUT_DIR = "dubbingDemoOutput"
 MAX_AUDIO_LENGTH = 30  # seconds
 
 # Configure logging
@@ -28,7 +26,7 @@ def setup_logging():
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.StreamHandler()  # Log to console
+            logging.StreamHandler()
         ]
     )
     return logging.getLogger(__name__)
@@ -42,9 +40,6 @@ s3 = boto3.client('s3') if S3_BUCKET else None
 model = None
 processor = None
 device = None
-
-# Model cache for performance optimization
-model_cache = {}
 
 # ------------------- UTILITIES ------------------- #
 
@@ -151,10 +146,13 @@ def ensure_model_cache_dir():
         return False
 
 def setup_model():
-    """Initialize the model"""
+    """Initialize the model from pre-downloaded cache"""
     global model, processor, device
     
     try:
+        # Clear memory first
+        clear_gpu_memory()
+        
         # Determine device
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Using device: {device}")
@@ -162,30 +160,65 @@ def setup_model():
         if torch.cuda.is_available():
             logger.info(f"CUDA version: {torch.version.cuda}")
             logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+            logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
         
-        # Load model and processor
-        logger.info("Loading model and processor...")
-        model_name = "facebook/seamless-m4t-v2-large"
+        # Check if model is already downloaded
+        model_local_path = os.path.join(MODEL_CACHE_DIR, "seamless-m4t-v2-large")
+        if not os.path.exists(model_local_path):
+            logger.warning("Model not found in cache, downloading now...")
+            from huggingface_hub import snapshot_download
+            snapshot_download(
+                repo_id="facebook/seamless-m4t-v2-large",
+                local_dir=model_local_path,
+                local_dir_use_symlinks=False,
+                resume_download=True
+            )
+        
+        # Load model and processor from local cache
+        logger.info("Loading model and processor from cache...")
         
         processor = AutoProcessor.from_pretrained(
-            model_name, 
+            model_local_path,
             cache_dir=MODEL_CACHE_DIR
         )
+        
+        # Load model with memory optimization
         model = SeamlessM4Tv2Model.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            model_local_path,
+            torch_dtype=torch.float16,
+            device_map="auto" if device == "cuda" else None,
+            low_cpu_mem_usage=True,
             cache_dir=MODEL_CACHE_DIR
         )
         
-        # Move model to appropriate device
-        model = model.to(device)
         model.eval()
+        logger.info("✅ Model loaded successfully from cache!")
         
-        logger.info("Model loaded successfully!")
+        # Verify model is working
+        with torch.no_grad():
+            test_input = processor(text="Hello", return_tensors="pt")
+            if device == "cuda":
+                test_input = {k: v.to(device) for k, v in test_input.items()}
+            test_output = model.generate(**test_input, tgt_lang="eng")
+            logger.info("✅ Model test passed!")
         
     except Exception as e:
         logger.error(f"Error loading model: {str(e)}")
-        raise e
+        # Fallback: try loading without device_map
+        try:
+            logger.info("Trying fallback loading without device_map...")
+            model_local_path = os.path.join(MODEL_CACHE_DIR, "seamless-m4t-v2-large")
+            model = SeamlessM4Tv2Model.from_pretrained(
+                model_local_path,
+                torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+                cache_dir=MODEL_CACHE_DIR
+            )
+            model = model.to(device)
+            model.eval()
+            logger.info("✅ Model loaded successfully with fallback method!")
+        except Exception as fallback_error:
+            logger.error(f"Fallback loading also failed: {str(fallback_error)}")
+            raise e
 
 def convert_to_wav(input_path: str) -> str:
     """Convert media file to 16kHz mono WAV"""
@@ -200,7 +233,7 @@ def convert_to_wav(input_path: str) -> str:
         ], check=True)
         return output_path
     except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg conversion failed error: {str(e)}")
+        logger.error(f"FFmpeg conversion failed: {str(e)}")
         raise RuntimeError(f"FFmpeg conversion failed: {str(e)}")
     except Exception as e:
         logger.error(f"Audio conversion error: {str(e)}")
@@ -258,27 +291,17 @@ def text_to_speech_dubbing(text: str, target_lang: str):
         raise
 
 def save_response_to_s3(job_id, response_data, status="success"):
-    """
-    Save response to S3 bucket in the appropriate directory structure
-    
-    Args:
-        job_id: The ID of the job
-        response_data: The response data to save
-        status: Status of the job (success, error, failed)
-    """
+    """Save response to S3 bucket"""
     if not S3_BUCKET:
         logger.warning("S3_BUCKET not configured, skipping response save")
         return False
     
     try:
-        # Create the directory path
         directory_path = f"{S3_OUTPUT_DIR}/{job_id}/"
         file_key = f"{directory_path}response.json"
         
-        # Convert response to JSON string
         response_json = json.dumps(response_data, indent=2, ensure_ascii=False)
         
-        # Upload to S3
         s3.put_object(
             Bucket=S3_BUCKET,
             Key=file_key,
@@ -294,29 +317,16 @@ def save_response_to_s3(job_id, response_data, status="success"):
         return False
 
 def save_audio_to_s3(job_id, audio_path, language):
-    """
-    Save audio file to S3 bucket
-    
-    Args:
-        job_id: The ID of the job
-        audio_path: Path to the audio file
-        language: Target language code
-    """
+    """Save audio file to S3 bucket"""
     if not S3_BUCKET:
         logger.warning("S3_BUCKET not configured, skipping audio save")
         return None
     
     try:
-        # Create the directory path
         directory_path = f"{S3_OUTPUT_DIR}/{job_id}/"
         file_key = f"{directory_path}dubbed_{language}.wav"
         
-        # Upload to S3
-        s3.upload_file(
-            audio_path,
-            S3_BUCKET,
-            file_key
-        )
+        s3.upload_file(audio_path, S3_BUCKET, file_key)
         
         s3_url = f"s3://{S3_BUCKET}/{file_key}"
         logger.info(f"Audio saved to S3: {s3_url}")
@@ -328,14 +338,14 @@ def save_audio_to_s3(job_id, audio_path, language):
 
 def handler(job):
     """RunPod serverless handler"""
-    try:
-        if not job.get("id"):
-            return {"error": "job id not found"}
-        
-        job_id = job["id"]
+    job_id = job.get("id", "unknown-job-id")
     
-        # Initialize response variable
-        response = {}
+    try:
+        # Check S3 configuration
+        if not S3_BUCKET:
+            response = {"error": "S3_BUCKET environment variable not configured", "job_id": job_id, "status": "failed"}
+            save_response_to_s3(job_id, response, "failed")
+            return response
         
         # Validate input
         if not job.get("input"):
@@ -369,16 +379,10 @@ def handler(job):
                     save_response_to_s3(job_id, response, "failed")
                     return response
                 
-                # 2. Convert to WAV (16 kHz mono) if needed
+                # 2. Convert to WAV
                 try:
-                    if not file_name.lower().endswith('.wav'):
-                        audio_path = convert_to_wav(local_path)
-                        temp_files.append(audio_path)
-                    else:
-                        # even if input is wav, re-encode to guarantee 16k mono
-                        audio_path_16k = convert_to_wav(local_path)
-                        temp_files.append(audio_path_16k)
-                        audio_path = audio_path_16k
+                    audio_path = convert_to_wav(local_path)
+                    temp_files.append(audio_path)
                 except Exception as e:
                     response = {"error": f"Audio processing failed: {str(e)}", "job_id": job_id, "status": "failed"}
                     save_response_to_s3(job_id, response, "failed")
@@ -433,14 +437,13 @@ def handler(job):
             save_response_to_s3(job_id, response, "failed")
 
         finally:
-            # Cleanup - Remove ALL temporary files
+            # Cleanup
             for file_path in temp_files:
                 try:
                     if os.path.exists(file_path):
                         os.remove(file_path)
-                        logger.info(f"Removed temporary file: {file_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to remove file {file_path}: {str(e)}")
+                except Exception:
+                    pass
             
             clear_gpu_memory()
             gc.collect()
@@ -454,20 +457,39 @@ def handler(job):
         return response
 
 if __name__ == "__main__":
-    print("Starting Dubbing API Endpoint...")
-
-    # Verify model cache directory at startup
+    print("🚀 Starting Dubbing API Endpoint...")
+    print(f"Python version: {sys.version}")
+    print(f"Torch version: {torch.__version__}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+    
+    # Check environment variables
+    if not S3_BUCKET:
+        print("⚠️  WARNING: S3_BUCKET_NAME environment variable not set")
+    
+    # Verify model cache directory
     if not ensure_model_cache_dir():
-        print("ERROR: Model cache directory is not accessible")
+        print("❌ ERROR: Model cache directory is not accessible")
         if os.environ.get("RUNPOD_SERVERLESS_MODE") == "true":
-            raise RuntimeError("Model cache directory is not accessible")
+            sys.exit(1)
     
     # Setup model
-    setup_model()
+    try:
+        setup_model()
+        print("✅ Model loaded successfully!")
+    except Exception as e:
+        print(f"❌ Model loading failed: {str(e)}")
+        if os.environ.get("RUNPOD_SERVERLESS_MODE") == "true":
+            sys.exit(1)
     
     if os.environ.get("RUNPOD_SERVERLESS_MODE") == "true":
+        print("🚀 Starting RunPod serverless handler...")
         runpod.serverless.start({"handler": handler})
     else:
+        print("🔧 Running in local test mode...")
         # Test with mock input
         test_result = handler({
             "id": "test-job-id-123",
