@@ -4,37 +4,45 @@ FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Set environment variables first
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC \
+    MODEL_CACHE_DIR=/app/models \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH \
+    PYTHONUNBUFFERED=1 \
+    HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
+    TRANSFORMERS_CACHE=/app/models \
+    HF_HOME=/app/models
+
+# Install system dependencies efficiently
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
     software-properties-common \
     wget \
     curl \
     git \
-    && add-apt-repository ppa:deadsnakes/ppa \
-    && apt-get update && apt-get install -y \
-    python3.10 \
-    python3.10-dev \
-    python3.10-distutils \
-    python3-pip \
+    ca-certificates \
     ffmpeg \
     libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Use python3.10 as default python
-RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
-    && update-alternatives --set python3 /usr/bin/python3.10 \
-    && ln -sf /usr/bin/python3 /usr/bin/python
+# Add deadsnakes PPA for Python 3.10
+RUN add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3.10-dev \
+    python3.10-distutils \
+    python3.10-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Python 3.10 as default
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 && \
+    update-alternatives --set python3 /usr/bin/python3.10 && \
+    ln -sf /usr/bin/python3 /usr/bin/python
 
 # Install pip for Python 3.10
 RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10
-
-# Set environment variables
-ENV MODEL_CACHE_DIR=/app/models
-ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
-ENV PYTHONUNBUFFERED=1
-ENV HF_HUB_DISABLE_SYMLINKS_WARNING=1
-ENV TRANSFORMERS_CACHE=/app/models
-ENV HF_HOME=/app/models
 
 # Create model cache directory
 RUN mkdir -p /app/models
@@ -44,9 +52,9 @@ COPY requirements.txt .
 COPY app.py .
 
 # Install Python dependencies with compatible versions
-RUN pip install --upgrade pip
-RUN pip install --no-cache-dir torch==2.0.1+cu118 torchaudio==2.0.2+cu118 --index-url https://download.pytorch.org/whl/cu118
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir torch==2.0.1+cu118 torchaudio==2.0.2+cu118 --index-url https://download.pytorch.org/whl/cu118 && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Verify model cache directory is accessible
 RUN python -c "\
@@ -61,6 +69,11 @@ with open(test_file, 'w') as f: \
     f.write('test'); \
 os.remove(test_file); \
 print('✅ Model cache directory is accessible and writable');"
+
+# Clean up to reduce image size
+RUN apt-get autoremove -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
 # Run the app
 CMD ["python", "app.py"]
