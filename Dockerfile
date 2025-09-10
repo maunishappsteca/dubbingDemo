@@ -30,11 +30,17 @@ RUN mkdir -p /app/models
 COPY requirements.txt .
 COPY app.py .
 
-RUN pip install --upgrade pip && \
-    pip install --no-cache-dir torch==2.0.1+cu118 torchaudio==2.0.2+cu118 \
-        --index-url https://download.pytorch.org/whl/cu118 \
-        --extra-index-url https://pypi.org/simple && \
-    pip install --no-cache-dir -r requirements.txt --extra-index-url https://pypi.org/simple
+
+RUN pip install --upgrade pip
+RUN pip install --no-cache-dir torch==2.0.1+cu118 torchaudio==2.0.2+cu118 --index-url https://download.pytorch.org/whl/cu118
+RUN pip install --no-cache-dir -r requirements.txt
+
+
+# RUN pip install --upgrade pip && \
+#     pip install --no-cache-dir torch==2.0.1+cu118 torchaudio==2.0.2+cu118 \
+#         --index-url https://download.pytorch.org/whl/cu118 \
+#         --extra-index-url https://pypi.org/simple && \
+#     pip install --no-cache-dir -r requirements.txt --extra-index-url https://pypi.org/simple
 
 # Pre-pull model into cache (optional but helps avoid slow startup)
 # RUN python -c "from transformers import AutoProcessor, SeamlessM4Tv2Model; \
