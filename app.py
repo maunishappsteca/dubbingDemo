@@ -45,131 +45,123 @@ def get_gpu_memory_usage():
             "allocated": torch.cuda.memory_allocated() / 1024**3,
             "cached": torch.cuda.memory_reserved() / 1024**3,
             "max_allocated": torch.cuda.max_memory_allocated() / 1024**3,
-            "max_cached": torch.cuda.max_memory_reserved() / 1024**3
+            "max_cached": torch.cuda.max_memory_reserved() / 1024**3,
         }
     return {}
 
 def clear_gpu_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        gc.collect()
 
-def setup_model():
-    """Lazy-load the model"""
-    global model, processor, device
-    if model is not None and processor is not None:
-        return  # already loaded
+def save_audio_to_s3(job_id, file_path, target_language):
+    if not S3_BUCKET:
+        logger.warning("S3_BUCKET_NAME environment variable not set. Skipping S3 upload.")
+        return None
 
     try:
-        clear_gpu_memory()
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Using device: {device}")
+        s3_key = f"{S3_OUTPUT_DIR}/{job_id}_{target_language}_{os.path.basename(file_path)}"
+        s3.upload_file(file_path, S3_BUCKET, s3_key)
+        s3_url = f"https://{S3_BUCKET}.s3.amazonaws.com/{s3_key}"
+        logger.info(f"Successfully uploaded {file_path} to S3 at {s3_url}")
+        return s3_url
+    except Exception as e:
+        logger.error(f"Failed to upload {file_path} to S3: {e}")
+        return None
 
-        if torch.cuda.is_available():
-            logger.info(f"CUDA version: {torch.version.cuda}")
-            logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-            logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+# ------------------- MAIN MODEL FUNCTIONS ------------------- #
+def load_model():
+    """Lazy loads the model and processor into global variables."""
+    global model, processor, device
+    if model is None:
+        logger.info("⏳ Loading model...")
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        torch_dtype = torch.float16 if COMPUTE_TYPE == "float16" and torch.cuda.is_available() else torch.float32
 
         model_name = "facebook/seamless-m4t-v2-large"
+        
+        processor = AutoProcessor.from_pretrained(
+            model_name,
+            cache_dir=MODEL_CACHE_DIR
+        )
 
-        processor = AutoProcessor.from_pretrained(model_name, cache_dir=MODEL_CACHE_DIR)
         model = SeamlessM4Tv2Model.from_pretrained(
             model_name,
-            torch_dtype=torch.float16,
-            device_map="auto" if device == "cuda" else None,
+            torch_dtype=torch_dtype,
+            device_map="auto" if torch.cuda.is_available() else None,
             low_cpu_mem_usage=True,
             cache_dir=MODEL_CACHE_DIR
         )
-        model.eval()
         logger.info("✅ Model loaded successfully!")
 
-    except Exception as e:
-        logger.error(f"Model loading failed: {str(e)}")
-        # Add more specific error information
-        if "CUDA" in str(e):
-            logger.error("CUDA might not be properly configured")
-        raise e
-
-def convert_to_wav(input_path: str) -> str:
-    """Convert to 16kHz mono wav"""
-    output_path = f"/tmp/{uuid.uuid4()}.wav"
-    subprocess.run([
-        "ffmpeg", "-y", "-i", input_path,
-        "-vn", "-ac", "1", "-ar", "16000",
-        "-acodec", "pcm_s16le", "-loglevel", "error", output_path
-    ], check=True)
-    return output_path
-
-def speech_to_speech_dubbing(audio_path: str, target_lang: str):
-    setup_model()
-    audio, orig_sr = sf.read(audio_path)
-
-    if orig_sr != 16000:
-        import librosa
-        audio = librosa.resample(audio, orig_sr=orig_sr, target_sr=16000)
-    if len(audio.shape) > 1:
-        audio = np.mean(audio, axis=1)
-
-    max_samples = MAX_AUDIO_LENGTH * 16000
-    if len(audio) > max_samples:
-        audio = audio[:max_samples]
-        logger.warning(f"Audio truncated to {MAX_AUDIO_LENGTH} seconds")
-
-    audio_inputs = processor(audios=audio, return_tensors="pt", sampling_rate=16000)
-    audio_inputs = {k: v.to(device) for k, v in audio_inputs.items()}
-
-    with torch.no_grad():
-        audio_array = model.generate(**audio_inputs, tgt_lang=target_lang)[0].cpu()
-    return audio_array
-
-def text_to_speech_dubbing(text: str, target_lang: str):
-    setup_model()
-    text_inputs = processor(text=text, return_tensors="pt")
-    text_inputs = {k: v.to(device) for k, v in text_inputs.items()}
-
-    with torch.no_grad():
-        audio_array = model.generate(**text_inputs, tgt_lang=target_lang)[0].cpu()
-    return audio_array
-
-def save_audio_to_s3(job_id, audio_path, language):
-    if not S3_BUCKET:
-        logger.warning("S3_BUCKET not configured")
-        return None
-    directory_path = f"{S3_OUTPUT_DIR}/{job_id}/"
-    file_key = f"{directory_path}dubbed_{language}.wav"
-    s3.upload_file(audio_path, S3_BUCKET, file_key)
-    return f"s3://{S3_BUCKET}/{file_key}"
-
-def handler(job):
-    job_id = job.get("id", "unknown-job-id")
+def speech_to_text_translation(audio_path, source_language, target_language):
+    """Transcribes and translates speech from an audio file."""
+    load_model()
     try:
-        if not job.get("input"):
-            return {"error": "No input provided", "job_id": job_id, "status": "failed"}
+        audio, _ = sf.read(audio_path, dtype='float32')
+        # Here we add the padding=True argument to prevent the error
+        inputs = processor(audios=audio, return_tensors="pt", padding=True).to(device)
+        
+        output_tokens = model.generate(
+            **inputs,
+            tgt_lang=target_language,
+            generate_speech=False,
+            sp_model_kwargs={"tgt_lang": target_language}
+        )
 
-        input_data = job["input"]
-        file_name = input_data.get("file_name")
+        translated_text = processor.decode(output_tokens[0].tolist()[0], skip_special_tokens=True)
+        return translated_text
+
+    except Exception as e:
+        logger.error(f"Speech-to-text translation failed: {e}")
+        raise
+
+def text_to_speech_dubbing(text, target_language):
+    """Generates speech from a given text."""
+    load_model()
+    try:
+        # Here we add the padding=True argument to prevent the error
+        text_inputs = processor(text=text, return_tensors="pt", padding=True).to(device)
+        audio_output = model.generate(**text_inputs, tgt_lang=target_language, generate_speech=True, )
+        result_audio = audio_output[0].cpu().numpy().squeeze()
+        return result_audio
+    except Exception as e:
+        logger.error(f"Text-to-speech dubbing failed: {e}")
+        raise
+
+def dubbing_pipeline(job_input):
+    """Main pipeline function to handle both translation and dubbing."""
+    job_id = runpod.get_job_id()
+    temp_files = []
+    
+    try:
+        input_data = job_input['input']
+        audio_url = input_data.get("audio_url")
         text = input_data.get("text")
-        target_language = input_data.get("target_language", "eng")
+        source_language = input_data.get("source_language")
+        target_language = input_data.get("target_language")
 
-        temp_files, response = [], {}
-        if file_name:
-            # Download from S3
-            local_path = f"/tmp/{uuid.uuid4()}_{os.path.basename(file_name)}"
-            s3.download_file(S3_BUCKET, file_name, local_path)
-            temp_files.append(local_path)
+        if not target_language:
+            raise ValueError("target_language must be provided.")
+        
+        if not (audio_url or text):
+            raise ValueError("Either 'audio_url' or 'text' must be provided.")
 
-            audio_path = convert_to_wav(local_path)
-            temp_files.append(audio_path)
+        if audio_url:
+            local_audio_path = f"/tmp/{uuid.uuid4()}_input.mp3"
+            subprocess.run(["wget", "-O", local_audio_path, audio_url], check=True)
+            temp_files.append(local_audio_path)
+            
+            translated_text = speech_to_text_translation(local_audio_path, source_language, target_language)
+            result_audio = text_to_speech_dubbing(translated_text, target_language)
 
-            result_audio = speech_to_speech_dubbing(audio_path, target_language)
             output_path = f"/tmp/{uuid.uuid4()}_dubbed.wav"
             sf.write(output_path, result_audio.numpy(), 16000)
             temp_files.append(output_path)
 
             s3_url = save_audio_to_s3(job_id, output_path, target_language)
             response = {"job_id": job_id, "status": "success", "s3_url": s3_url,
-                        "target_language": target_language, "gpu_memory": get_gpu_memory_usage()}
+                        "translated_text": translated_text, "target_language": target_language,
+                        "gpu_memory": get_gpu_memory_usage()}
         else:
             result_audio = text_to_speech_dubbing(text, target_language)
             output_path = f"/tmp/{uuid.uuid4()}_tts.wav"
@@ -193,8 +185,5 @@ def handler(job):
 #initial
 if __name__ == "__main__":
     print("🚀 Starting Dubbing API Endpoint...")
-    if os.environ.get("RUNPOD_SERVERLESS_MODE") == "true":
-        runpod.serverless.start({"handler": handler})
-    else:
-        test_result = handler({"id": "test", "input": {"text": "Hello test", "target_language": "spa"}})
-        print("Test Result:", json.dumps(test_result, indent=2))
+    load_model()
+    runpod.serverless.start({"handler": dubbing_pipeline})
