@@ -85,7 +85,10 @@ def setup_model():
         logger.info("✅ Model loaded successfully!")
 
     except Exception as e:
-        logger.error(f"Error loading model: {str(e)}")
+        logger.error(f"Model loading failed: {str(e)}")
+        # Add more specific error information
+        if "CUDA" in str(e):
+            logger.error("CUDA might not be properly configured")
         raise e
 
 def convert_to_wav(input_path: str) -> str:
