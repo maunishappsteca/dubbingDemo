@@ -11,7 +11,7 @@ protobuf==3.20.3
 # Audio + processing
 numpy>=1.22.0
 librosa==0.10.0
-soundfile==0.12.0
+soundfile==0.12.1
 ffmpeg-python==0.2.0
 
 # Cloud + infra
