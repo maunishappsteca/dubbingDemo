@@ -130,7 +130,13 @@ def text_to_speech_dubbing(text, target_language):
 
 def dubbing_pipeline(job_input):
     """Main pipeline function to handle both translation and dubbing."""
-    job_id = runpod.get_job_id()
+    # job_id = runpod.get_job_id()
+
+    if not job.get("id"):
+        return {"error": "job id not found"}
+        
+    job_id = job["id"]
+    
     temp_files = []
     
     try:
