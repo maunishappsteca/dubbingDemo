@@ -132,10 +132,10 @@ def dubbing_pipeline(job_input):
     """Main pipeline function to handle both translation and dubbing."""
     # job_id = runpod.get_job_id()
 
-    if not job.get("id"):
+    if not job_input.get("id"):
         return {"error": "job id not found"}
         
-    job_id = job["id"]
+    job_id = job_input["id"]
     
     temp_files = []
     
